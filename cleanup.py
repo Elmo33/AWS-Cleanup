@@ -11,37 +11,58 @@ def get_autoscaling_group(instance_id, autoscaling_client):
     return "N/A"
 
 
-def get_instances_details(ec2_client, autoscaling_client, instance_ids=None, public_ips=None, vpc_ids=None):
+def get_instances_details(ec2_client, autoscaling_client, eks_client, instance_id=None, public_ip=None, vpc_id=None):
     """Retrieve details of instances based on instance IDs, public IPs, or VPC IDs."""
-    if vpc_ids:
-        instance_ids = instance_ids or []
-        for vpc_id in vpc_ids:
-            response = ec2_client.describe_instances(
-                Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
-            )
-            instance_ids.extend([instance["InstanceId"] for reservation in response["Reservations"] for instance in reservation["Instances"]])
+    resources = {
+        "EKS Cluster": None,
+        "VpcId": vpc_id,
+        "Instances": []
+    }
 
+    if vpc_id:
+        response = ec2_client.describe_instances(
+            Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+        )
+        instance_ids = [
+            instance["InstanceId"]
+            for reservation in response["Reservations"]
+            for instance in reservation["Instances"]
+        ]
+
+        if not instance_ids:
+            print(f"No instances found for VPC {vpc_id}")
+
+            # Fetch VPC details
+            resources.update({
+                "InternetGatewayIds": [
+                    igw["InternetGatewayId"] for igw in ec2_client.describe_internet_gateways(
+                        Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}]
+                    )["InternetGateways"]
+                ],
+                "SubnetIds": [
+                    subnet["SubnetId"] for subnet in ec2_client.describe_subnets(
+                        Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+                    )["Subnets"]
+                ],
+                "EKS Cluster": get_eks_cluster(eks_client, vpc_id),
+            })
+            return resources
 
     filters = []
-
-    if instance_ids:
-        filters.append({"Name": "instance-id", "Values": instance_ids})
-
-    if public_ips:
-        filters.append({"Name": "ip-address", "Values": public_ips})
-
-    if not filters and not vpc_ids:
+    if instance_id:
+        filters.append({"Name": "instance-id", "Values": instance_id})
+    if public_ip:
+        filters.append({"Name": "ip-address", "Values": public_ip})
+    if not filters and not vpc_id:
         raise ValueError("At least one of --public-ip, --instance-id, or --vpc-id must be provided.")
 
     response = ec2_client.describe_instances(Filters=filters)
-    instances_data = []
 
     for reservation in response["Reservations"]:
         for instance in reservation["Instances"]:
             instance_id = instance["InstanceId"]
             state = instance["State"]["Name"]
 
-            # Exclude instances that are stopped or terminated
             if state in ["stopped", "terminated"]:
                 continue
 
@@ -51,15 +72,19 @@ def get_instances_details(ec2_client, autoscaling_client, instance_ids=None, pub
             instance_data = {
                 "InstanceId": instance_id,
                 "PublicIpAddress": instance.get("PublicIpAddress", "N/A"),
-                "State": instance["State"]["Name"],
+                "State": state,
                 "LaunchTime": instance["LaunchTime"].strftime("%Y-%m-%d %H:%M:%S"),
                 "VpcId": vpc_id,
-                "InternetGatewayIds": [igw["InternetGatewayId"] for igw in ec2_client.describe_internet_gateways(
-                    Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}])
-                ["InternetGateways"]] if vpc_id else [],
-                "SubnetIds": [subnet["SubnetId"] for subnet in
-                              ec2_client.describe_subnets(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
-                              ["Subnets"]] if vpc_id else [],
+                "InternetGatewayIds": [
+                    igw["InternetGatewayId"] for igw in ec2_client.describe_internet_gateways(
+                        Filters=[{"Name": "attachment.vpc-id", "Values": [vpc_id]}]
+                    )["InternetGateways"]
+                ] if vpc_id else [],
+                "SubnetIds": [
+                    subnet["SubnetId"] for subnet in ec2_client.describe_subnets(
+                        Filters=[{"Name": "vpc-id", "Values": [vpc_id]}]
+                    )["Subnets"]
+                ] if vpc_id else [],
                 "NetworkInterfaceId": instance["NetworkInterfaces"][0]["NetworkInterfaceId"]
                 if instance.get("NetworkInterfaces") else "N/A",
                 "SecurityGroupIds": [
@@ -76,26 +101,35 @@ def get_instances_details(ec2_client, autoscaling_client, instance_ids=None, pub
                 "AutoScalingGroup": asg_name
             }
 
-            instances_data.append(instance_data)
+            resources["Instances"].append(instance_data)
 
-    return instances_data
+            # Ensure EKS Cluster is set if not already
+            if not resources["EKS Cluster"]:
+                resources["EKS Cluster"] = get_eks_cluster(eks_client, vpc_id)
+
+    return resources
 
 
-def print_resource_info(instance_details):
-    for instance in instance_details:
-        print(f"Instance ID: {instance['InstanceId']}")
-        print(f"Public IP: {instance['PublicIpAddress']}")
-        print(f"State: {instance['State']}")
-        print(f"Launch Time: {instance['LaunchTime']}")
-        print(f"VPC ID: {instance['VpcId']}")
-        print(f"IGW IDs: {instance['InternetGatewayIds']}")
-        print(f"Subnet IDs: {instance['SubnetIds']}")
-        print(f"Network Interface ID: {instance['NetworkInterfaceId']}")
-        print(f"Security Group IDs: {instance['SecurityGroupIds']}")
-        print(f"IAM Instance Profile: {instance['IamInstanceProfile']}")
-        print(f"Block Device Mappings: {instance['BlockDeviceMappings']}")
-        print(f"Auto Scaling Group: {instance['AutoScalingGroup']}")
-        print()
+def print_resource_info(resources):
+    print(f"EKS Cluster: {resources['EKS Cluster'] if resources['EKS Cluster'] else 'N/A'}")
+    print(f"VPC ID: {resources['VpcId'] if resources['VpcId'] else 'N/A'}")
+
+    if "InternetGatewayIds" in resources:
+        print(
+            f"Internet Gateway IDs: {', '.join(resources['InternetGatewayIds']) if resources['InternetGatewayIds'] else 'N/A'}")
+
+    if "SubnetIds" in resources:
+        print(f"Subnet IDs: {', '.join(resources['SubnetIds']) if resources['SubnetIds'] else 'N/A'}")
+
+    print("\nInstances:")
+    if not resources["Instances"]:
+        print("No instances found.\n")
+        return
+
+    for instance in resources["Instances"]:
+        for key, value in instance.items():
+            print(f"{key}: {value if value else 'N/A'}")
+        print()  # Blank line for separation
 
 
 def detach_iam_instance_profile(ec2_client, instance_profile_arn):
@@ -109,7 +143,6 @@ def detach_iam_instance_profile(ec2_client, instance_profile_arn):
     for assoc in response["IamInstanceProfileAssociations"]:
         if assoc["IamInstanceProfile"]["Arn"] == instance_profile_arn:
             ec2_client.disassociate_iam_instance_profile(AssociationId=assoc["AssociationId"])
-
 
 
 def terminate_instance(ec2_client, instance_id):
@@ -133,7 +166,6 @@ def terminate_asg(autoscaling_client, asg_name):
     autoscaling_client.delete_auto_scaling_group(AutoScalingGroupName=asg_name, ForceDelete=True)
 
 
-
 # Function to delete subnets
 def delete_subnet(ec2_client, subnet_id):
     if subnet_id == "N/A":
@@ -149,6 +181,7 @@ def delete_vpc(ec2_client, vpc_id):
         print("Invalid VPC ID.")
         return  # Skip if VPC ID is invalid
 
+    delete_vpc_endpoints(ec2_client, vpc_id)
     delete_internet_gateways(ec2_client, vpc_id)
     delete_all_subnets(ec2_client, vpc_id)
     print(f"Deleting VPC {vpc_id}...")
@@ -169,7 +202,6 @@ def delete_internet_gateways(ec2_client, vpc_id):
         ec2_client.delete_internet_gateway(InternetGatewayId=igw_id)
 
 
-
 # Function to delete all subnets in a VPC
 def delete_all_subnets(ec2_client, vpc_id):
     if vpc_id == "N/A":
@@ -181,14 +213,53 @@ def delete_all_subnets(ec2_client, vpc_id):
         subnet_id = subnet["SubnetId"]
         delete_subnet(ec2_client, subnet_id)
 
+# Function to delete VPC endpoints
+def delete_vpc_endpoints(ec2_client, vpc_id):
+    if vpc_id == "N/A":
+        print("Invalid VPC ID.")
+        return  # Skip if VPC ID is invalid
+
+    response = ec2_client.describe_vpc_endpoints(Filters=[{"Name": "vpc-id", "Values": [vpc_id]}])
+    for endpoint in response["VpcEndpoints"]:
+        endpoint_id = endpoint["VpcEndpointId"]
+        print(f"Deleting VPC Endpoint {endpoint_id}...")
+        ec2_client.delete_vpc_endpoints(VpcEndpointIds=[endpoint_id])
+
+
+def get_eks_cluster(eks_client, vpc_id):
+    """Retrieve the EKS cluster associated with the given VPC."""
+    response = eks_client.list_clusters()
+    for cluster_name in response.get("clusters", []):
+        cluster_desc = eks_client.describe_cluster(name=cluster_name)
+        if cluster_desc["cluster"]["resourcesVpcConfig"]["vpcId"] == vpc_id:
+            return cluster_name
+    return None
+
+
+def delete_eks_cluster(eks_client, eks_cluster_name):
+    """Delete all node groups before deleting the EKS cluster."""
+    if eks_cluster_name:
+        print(f"Deleting node groups for EKS cluster {eks_cluster_name}...")
+        node_groups = eks_client.list_nodegroups(clusterName=eks_cluster_name)["nodegroups"]
+        for node_group in node_groups:
+            eks_client.delete_nodegroup(clusterName=eks_cluster_name, nodegroupName=node_group)
+            print(f"Deleted node group {node_group}")
+
+        waiter = eks_client.get_waiter('nodegroup_deleted')
+        for node_group in node_groups:
+            waiter.wait(clusterName=eks_cluster_name, nodegroupName=node_group)
+
+        print(f"Deleting EKS cluster {eks_cluster_name}...")
+        eks_client.delete_cluster(name=eks_cluster_name)
+
 
 # Iterate through the JSON data and delete resources in the correct order
 def main():
     parser = argparse.ArgumentParser(description="Fetch AWS instance details based on Instance ID or Public IP.")
 
-    parser.add_argument("--public-ips", nargs="+", help="Public IP(s) of the instances.")
-    parser.add_argument("--instance-ids", nargs="+", help="Instance ID(s) of the instances.")
-    parser.add_argument("--vpc-ids",   help="VPC IDs.")
+    parser.add_argument("--public-ip", nargs="+", help="Public IP(s) of the instances.")
+    parser.add_argument("--instance-id", nargs="+", help="Instance ID(s) of the instances.")
+    parser.add_argument("--vpc-id", help="VPC IDs.")
     parser.add_argument("--region", help="AWS region.")
     parser.add_argument("--no-dry-run", action="store_true", help="Execute the deletion process.")
 
@@ -196,26 +267,47 @@ def main():
 
     ec2_client = boto3.client("ec2", region_name=args.region)  # Adjust the region as needed
     autoscaling_client = boto3.client("autoscaling", region_name=args.region)
+    eks_client = boto3.client("eks", region_name=args.region)
 
+    vpc_id = args.vpc_id
 
-    instances = get_instances_details(ec2_client, autoscaling_client, instance_ids=args.instance_ids,
-                                      public_ips=args.public_ips, vpc_ids=args.vpc_ids)
+    resources = get_instances_details(
+        ec2_client=ec2_client,
+        autoscaling_client=autoscaling_client,
+        eks_client=eks_client,
+        instance_id=args.instance_id,
+        public_ip=args.public_ip, vpc_id=args.vpc_id
+    )
 
     print("These resources will be deleted:")
-    print_resource_info(instances)
+    print_resource_info(resources)
 
     if not args.no_dry_run:
         print("Dry run completed. Use --no-dry-run to execute the deletion process.")
         return
 
-    for instance_data in instances:
+    if resources["EKS Cluster"]:
+        delete_eks_cluster(eks_client=eks_client, eks_cluster_name=resources["EKS Cluster"])
+
+        print("Updating the resources after removing the EKS cluster")
+        resources = get_instances_details(
+            ec2_client=ec2_client,
+            autoscaling_client=autoscaling_client,
+            eks_client=eks_client,
+            instance_id=args.instance_id,
+            public_ip=args.public_ip, vpc_id=args.vpc_id
+        )
+        print("Resources left for deletion:")
+        print_resource_info(resources)
+
+    for instance_data in resources["Instances"]:
         if not instance_data:  # Skip empty entries
             continue
 
-        instance_id = instance_data["InstanceId"]
-        vpc_id = instance_data["VpcId"]
+        instance_id = instance_data.get("InstanceId", "N/A")
+        vpc_id = instance_data.get("VpcId", "N/A") if vpc_id is None else vpc_id
         iam_profile_arn = instance_data.get("IamInstanceProfile", "N/A")
-        asg_name = instance_data["AutoScalingGroup"]
+        asg_name = instance_data.get("AutoScalingGroup", "N/A")
 
         terminate_asg(autoscaling_client=autoscaling_client, asg_name=asg_name)
 
@@ -223,6 +315,7 @@ def main():
 
         terminate_instance(ec2_client=ec2_client, instance_id=instance_id)
 
+    if vpc_id:
         delete_vpc(ec2_client=ec2_client, vpc_id=vpc_id)
 
 

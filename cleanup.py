@@ -47,7 +47,6 @@ def get_instances_details(ec2_client, autoscaling_client, eks_client, instance_i
                 "EKS Cluster": get_eks_cluster(eks_client, vpc_id),
             })
             return resources
-
     filters = []
     if instance_id:
         filters.append({"Name": "instance-id", "Values": instance_id})
@@ -270,7 +269,7 @@ def main():
     eks_client = boto3.client("eks", region_name=args.region)
 
     vpc_id = args.vpc_id
-
+    print("retrieving details...")
     resources = get_instances_details(
         ec2_client=ec2_client,
         autoscaling_client=autoscaling_client,
